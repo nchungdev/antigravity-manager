@@ -1,0 +1,22 @@
+services:
+  agy-manager:
+    image: python:3.11-slim
+    container_name: agy-manager
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    ports:
+      - "${PORT:-8585}:8585"
+    volumes:
+      # Mount host user's home directory so agy credentials & configs are accessed
+      - "${USER_HOME:-/home/chungnh}:${USER_HOME:-/home/chungnh}"
+      - ./server.py:/app/server.py:ro
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    environment:
+      - PORT=${PORT:-8585}
+      - HOST_USER=${HOST_USER:-chungnh}
+      - USER_HOME=${USER_HOME:-/home/chungnh}
+      - AGY_BIN=${AGY_BIN:-}
+      - SYSTEMD_SERVICE=${SYSTEMD_SERVICE:-antigravity-cli-daemon.service}
+      - TZ=${TZ:-Asia/Ho_Chi_Minh}
+    command: python3 -u /app/server.py

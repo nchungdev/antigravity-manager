@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Credentials & Sensitive Data
+*.token
+antigravity-oauth-token
+oauth_creds.json
+google_accounts.json
+profiles.json
+profiles/
+
+# Logs & Temp
+*.log
+tmp/
+.gemini/tmp/
+
+# OS specific
+.DS_Store
+Thumbs.db
