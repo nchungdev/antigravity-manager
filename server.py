@@ -47,7 +47,19 @@ GEMINI_DIR = os.path.join(USER_HOME, ".gemini")
 AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
 PROFILES_DIR = os.path.join(GEMINI_DIR, "profiles")
 PROFILES_JSON = os.path.join(PROFILES_DIR, "profiles.json")
-AGY_BIN = os.environ.get("AGY_BIN", shutil.which("agy") or os.path.join(USER_HOME, ".local/bin/agy"))
+def resolve_agy_bin():
+    env_bin = (os.environ.get("AGY_BIN") or "").strip()
+    if env_bin:
+        return env_bin
+    user_local_bin = os.path.join(USER_HOME, ".local/bin/agy")
+    if os.path.exists(user_local_bin):
+        return user_local_bin
+    which_bin = shutil.which("agy")
+    if which_bin:
+        return which_bin
+    return user_local_bin
+
+AGY_BIN = resolve_agy_bin()
 DAEMON_SVC = os.environ.get("SYSTEMD_SERVICE", "antigravity-cli-daemon.service")
 DAEMON_SVC_PATH = os.path.join(USER_HOME, f".config/systemd/user/{DAEMON_SVC}")
 SETTINGS_PATH = os.path.join(AGY_CLI_DIR, "settings.json")

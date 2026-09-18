@@ -17,7 +17,6 @@ COPY server.py /app/server.py
 ENV PORT=8585
 ENV HOST_USER=root
 ENV USER_HOME=/root
-ENV AGY_BIN=""
 ENV SYSTEMD_SERVICE=antigravity-cli-daemon.service
 ENV TZ=Asia/Ho_Chi_Minh
 
