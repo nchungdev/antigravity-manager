@@ -55,7 +55,57 @@ flowchart TD
 
 ## 🚀 Quick Start
 
-### Method 1: Docker Compose (Recommended)
+### ⚡ 1-Line Universal Install (Fastest)
+
+Run this single command on any Linux terminal (Debian, Ubuntu, OpenMediaVault, TrueNAS, Unraid):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nchungdev/antigravity-manager/main/install.sh | bash
+```
+*This interactive script auto-detects your environment and lets you choose between Docker (pulling the pre-built GHCR image) or a Standalone Binary (no Docker/Python needed).*
+
+---
+
+### Method 1: Docker (Pre-built Image from GHCR - No Build Required)
+
+```bash
+docker run -d \
+  --name agy-manager \
+  --restart unless-stopped \
+  --privileged \
+  --pid host \
+  -p 8585:8585 \
+  -v /home/$USER:/home/$USER \
+  -v /etc/ssl/certs:/etc/ssl/certs:ro \
+  -e HOST_USER=$USER \
+  -e USER_HOME=/home/$USER \
+  ghcr.io/nchungdev/antigravity-manager:latest
+```
+
+Or with **Docker Compose**:
+```yaml
+services:
+  agy-manager:
+    image: ghcr.io/nchungdev/antigravity-manager:latest
+    container_name: agy-manager
+    restart: unless-stopped
+    privileged: true
+    pid: host
+    ports:
+      - "8585:8585"
+    volumes:
+      - /home/${USER}:/home/${USER}
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    environment:
+      - HOST_USER=${USER}
+      - USER_HOME=/home/${USER}
+      - SYSTEMD_SERVICE=antigravity-cli-daemon.service
+      - TZ=Asia/Ho_Chi_Minh
+```
+
+---
+
+### Method 2: Build from Source (Git Clone)
 
 1. **Clone the repository:**
    ```bash
