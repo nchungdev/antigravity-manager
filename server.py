@@ -21,8 +21,66 @@ import subprocess
 import threading
 import pty
 import select
+import secrets
+from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+def _load_env_file():
+    for env_path in [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        "/home/chungnh/antigravity-manager/.env",
+        "/docker-files/agy-manager/agy-manager.env"
+    ]:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+_load_env_file()
+
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() in ("true", "1", "yes")
+ADMIN_USER = os.environ.get("ADMIN_USER") or os.environ.get("AUTH_USER") or "chungnh"
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or os.environ.get("AUTH_PASSWORD") or "As123456"
+
+WEB_SESSIONS = {}
+WEB_SESSIONS_LOCK = threading.Lock()
+
+def create_web_session(user):
+    token = secrets.token_hex(24)
+    with WEB_SESSIONS_LOCK:
+        WEB_SESSIONS[token] = {
+            "user": user,
+            "expires": time.time() + 86400 * 30  # 30 days
+        }
+    return token
+
+def validate_web_session(token):
+    if not token:
+        return None
+    with WEB_SESSIONS_LOCK:
+        sess = WEB_SESSIONS.get(token)
+        if sess:
+            if sess["expires"] > time.time():
+                return sess["user"]
+            else:
+                del WEB_SESSIONS[token]
+    return None
+
+def delete_web_session(token):
+    if not token:
+        return
+    with WEB_SESSIONS_LOCK:
+        WEB_SESSIONS.pop(token, None)
 
 PORT = int(os.environ.get("PORT", "8585"))
 
@@ -759,8 +817,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <p style="color: var(--text-muted); font-size: 0.85rem;">OpenMediaVault 7 Control Hub</p>
         </div>
       </div>
-      <div>
+      <div style="display: flex; align-items: center; gap: 0.75rem;">
+        <span id="user-display" style="font-size: 0.85rem; color: var(--text-muted); font-weight: 600;"></span>
         <button class="btn btn-secondary btn-sm" onclick="refreshAll()">🔄 Refresh All</button>
+        <button id="btn-logout" class="btn btn-danger btn-sm" onclick="logout()" style="display: none;">Đăng xuất</button>
       </div>
     </header>
 
@@ -998,6 +1058,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Modal Login Authentication -->
+  <div id="modal-login" class="modal" style="z-index: 200;">
+    <div class="modal-content" style="max-width: 400px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7); border-color: #475569;">
+      <div style="text-align: center; margin-bottom: 1.5rem;">
+        <span class="logo-badge" style="font-size: 1.5rem; padding: 0.5rem 1rem; border-radius: 12px; display: inline-block; margin-bottom: 0.75rem;">AGY</span>
+        <h2 style="font-size: 1.3rem; font-weight: 700; color: #fff;">Đăng nhập AGY Manager</h2>
+        <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">Hệ thống OpenMediaVault Control Hub</p>
+      </div>
+      <form onsubmit="handleWebLogin(event)">
+        <div class="form-group">
+          <label>Tài khoản</label>
+          <input type="text" id="web-login-user" required class="form-control" value="chungnh">
+        </div>
+        <div class="form-group" style="margin-bottom: 1.25rem;">
+          <label>Mật khẩu</label>
+          <input type="password" id="web-login-pass" required placeholder="Nhập mật khẩu" class="form-control">
+        </div>
+        <div id="web-login-error" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 0.6rem; border-radius: 6px; font-size: 0.82rem; margin-bottom: 1rem; text-align: center;"></div>
+        <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center; padding: 0.7rem; font-size: 0.95rem;">Đăng nhập</button>
+      </form>
+    </div>
+  </div>
+
   <div id="toast" class="toast"></div>
 
   <script>
@@ -1060,7 +1143,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     function openSaveModal() { document.getElementById('modal-save').classList.add('active'); }
     function closeModals() { 
-      document.querySelectorAll('.modal').forEach(m => m.classList.remove('active')); 
+      document.querySelectorAll('.modal:not(#modal-login)').forEach(m => m.classList.remove('active')); 
       if (oauthPollTimer) clearInterval(oauthPollTimer);
       if (activeOAuthSession) {
         fetch(`/api/auth/cancel?session_id=${activeOAuthSession}`, { method: 'POST' });
@@ -1143,6 +1226,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status');
+        if (res.status === 401) {
+          currentUser = null;
+          document.getElementById('modal-login').classList.add('active');
+          const logoutBtn = document.getElementById('btn-logout');
+          if (logoutBtn) logoutBtn.style.display = 'none';
+          return;
+        }
         const data = await res.json();
         
         // Daemon info & button visibility
@@ -1562,31 +1652,107 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    let currentUser = null;
+    let initialTimersStarted = false;
+
+    async function checkAuthAndInit() {
+      try {
+        const res = await fetch('/api/me');
+        const data = await res.json();
+        if (data.authenticated) {
+          currentUser = data.user;
+          document.getElementById('modal-login').classList.remove('active');
+          const userDisplay = document.getElementById('user-display');
+          if (userDisplay) userDisplay.innerText = `👤 ${data.user}`;
+          const logoutBtn = document.getElementById('btn-logout');
+          if (logoutBtn) logoutBtn.style.display = 'inline-flex';
+          startAppTimers();
+        } else {
+          document.getElementById('modal-login').classList.add('active');
+          const logoutBtn = document.getElementById('btn-logout');
+          if (logoutBtn) logoutBtn.style.display = 'none';
+        }
+      } catch (err) {
+        document.getElementById('modal-login').classList.add('active');
+      }
+    }
+
+    async function handleWebLogin(e) {
+      e.preventDefault();
+      const u = document.getElementById('web-login-user').value.trim();
+      const p = document.getElementById('web-login-pass').value;
+      const errEl = document.getElementById('web-login-error');
+      errEl.style.display = 'none';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u, password: p })
+        });
+        const data = await res.json();
+        if (data.success) {
+          currentUser = data.user;
+          document.getElementById('modal-login').classList.remove('active');
+          const userDisplay = document.getElementById('user-display');
+          if (userDisplay) userDisplay.innerText = `👤 ${data.user}`;
+          const logoutBtn = document.getElementById('btn-logout');
+          if (logoutBtn) logoutBtn.style.display = 'inline-flex';
+          startAppTimers();
+          refreshAll();
+        } else {
+          errEl.innerText = data.message || 'Tên đăng nhập hoặc mật khẩu không đúng';
+          errEl.style.display = 'block';
+        }
+      } catch (err) {
+        errEl.innerText = 'Lỗi kết nối máy chủ: ' + err.message;
+        errEl.style.display = 'block';
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+      } catch (e) {}
+      currentUser = null;
+      document.getElementById('modal-login').classList.add('active');
+      const passInput = document.getElementById('web-login-pass');
+      if (passInput) passInput.value = '';
+      const logoutBtn = document.getElementById('btn-logout');
+      if (logoutBtn) logoutBtn.style.display = 'none';
+      const userDisplay = document.getElementById('user-display');
+      if (userDisplay) userDisplay.innerText = '';
+    }
+
+    function startAppTimers() {
+      if (initialTimersStarted) return;
+      initialTimersStarted = true;
+      fetchStatus();
+      fetchLogs();
+      setInterval(fetchStatus, 5000);
+      setInterval(fetchLogs, 4000);
+
+      const savedInterval = localStorage.getItem('agy_usage_interval');
+      const initialInterval = (savedInterval !== null) ? parseInt(savedInterval) : 60;
+      const intervalSelectElem = document.getElementById('usage-interval');
+      if (intervalSelectElem) {
+        intervalSelectElem.value = initialInterval;
+      }
+      if (initialInterval > 0) {
+        usageIntervalTimer = setInterval(() => fetchUsage(true), initialInterval * 1000);
+      }
+      setTimeout(() => fetchUsage(true), 500);
+    }
+
     function refreshAll() {
+      if (!currentUser) return;
       fetchStatus();
       fetchLogs();
       fetchUsage(false);
       showToast("Đã làm mới toàn bộ dữ liệu");
     }
 
-    // Initial load
-    fetchStatus();
-    fetchLogs();
-    setInterval(fetchStatus, 5000);
-    setInterval(fetchLogs, 4000);
-
-    // Initialize usage interval from preferences (default 60s / 1m)
-    const savedInterval = localStorage.getItem('agy_usage_interval');
-    const initialInterval = (savedInterval !== null) ? parseInt(savedInterval) : 60;
-    const intervalSelectElem = document.getElementById('usage-interval');
-    if (intervalSelectElem) {
-      intervalSelectElem.value = initialInterval;
-    }
-    if (initialInterval > 0) {
-      usageIntervalTimer = setInterval(() => fetchUsage(true), initialInterval * 1000);
-    }
-    // Pull usage once immediately on page load
-    setTimeout(() => fetchUsage(true), 500);
+    // Check auth on page load
+    checkAuthAndInit();
   </script>
 </body>
 </html>
@@ -1611,14 +1777,86 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode('utf-8'))
 
+    def _get_cookie(self, name):
+        cookie_header = self.headers.get('Cookie')
+        if not cookie_header:
+            return None
+        try:
+            cookie = SimpleCookie(cookie_header)
+            if name in cookie:
+                return cookie[name].value
+        except Exception:
+            pass
+        return None
+
+    def _check_auth(self):
+        if not AUTH_ENABLED:
+            return True, ADMIN_USER
+
+        auth_header = self.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:].strip()
+            user = validate_web_session(token)
+            if user:
+                return True, user
+        elif auth_header.startswith('Basic '):
+            try:
+                decoded = base64.b64decode(auth_header[6:].strip()).decode('utf-8')
+                u, p = decoded.split(':', 1)
+                if u == ADMIN_USER and p == ADMIN_PASSWORD:
+                    return True, u
+            except Exception:
+                pass
+
+        token = self._get_cookie('agy_session')
+        user = validate_web_session(token)
+        if user:
+            return True, user
+
+        return False, None
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        # Healthcheck endpoints
+        if path in ("/health", "/api/health"):
+            self._send_json({"status": "ok"})
+            return
+
+        # Docker healthcheck fallback: localhost curl to /api/status
+        if path == "/api/status" and self.client_address[0] in ("127.0.0.1", "::1", "localhost") and "curl" in self.headers.get("User-Agent", "").lower():
+            daemon = get_daemon_status()
+            acc = get_active_account()
+            profiles = get_profiles_data()
+            perms = get_permission_mode()
+            self._send_json({
+                "daemon": daemon,
+                "account": acc,
+                "profiles": profiles,
+                "permissions": perms
+            })
+            return
+
+        # Auth status
+        if path == "/api/me":
+            is_auth, user = self._check_auth()
+            self._send_json({"authenticated": is_auth, "user": user if is_auth else None})
+            return
+
+        # HTML shell
         if path == "/" or path == "/index.html":
             self._send_html(HTML_TEMPLATE)
-        elif path == "/api/status":
+            return
+
+        # Protected GET APIs
+        is_auth, _ = self._check_auth()
+        if not is_auth:
+            self._send_json({"error": "Unauthorized", "message": "Vui lòng đăng nhập"}, 401)
+            return
+
+        if path == "/api/status":
             daemon = get_daemon_status()
             acc = get_active_account()
             profiles = get_profiles_data()
@@ -1648,6 +1886,42 @@ class RequestHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length).decode('utf-8') if length > 0 else ""
+
+        # Login
+        if path == "/api/login":
+            try:
+                data = json.loads(body)
+                u = data.get("username", "").strip()
+                p = data.get("password", "")
+                if u == ADMIN_USER and p == ADMIN_PASSWORD:
+                    token = create_web_session(u)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Set-Cookie', f'agy_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "user": u, "token": token}).encode('utf-8'))
+                else:
+                    self._send_json({"success": False, "message": "Tên đăng nhập hoặc mật khẩu không đúng"}, 401)
+            except Exception as e:
+                self._send_json({"success": False, "message": str(e)}, 400)
+            return
+
+        # Logout
+        if path == "/api/logout":
+            token = self._get_cookie('agy_session')
+            delete_web_session(token)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Set-Cookie', 'agy_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+            return
+
+        # Protected POST APIs
+        is_auth, _ = self._check_auth()
+        if not is_auth:
+            self._send_json({"error": "Unauthorized", "message": "Vui lòng đăng nhập"}, 401)
+            return
 
         if path.startswith("/api/daemon/"):
             action = path.split("/")[-1]
