@@ -22,6 +22,8 @@ import threading
 import pty
 import select
 import secrets
+import hashlib
+import hmac
 from http.cookies import SimpleCookie
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -29,7 +31,7 @@ from urllib.parse import urlparse, parse_qs
 def _load_env_file():
     for env_path in [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
-        "/home/chungnh/antigravity-manager/.env",
+        "/home/chungnh/AI Workspace/projects/antigravity-manager/.env",
         "/docker-files/agy-manager/agy-manager.env"
     ]:
         if os.path.exists(env_path):
@@ -105,6 +107,85 @@ GEMINI_DIR = os.path.join(USER_HOME, ".gemini")
 AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
 PROFILES_DIR = os.path.join(GEMINI_DIR, "profiles")
 PROFILES_JSON = os.path.join(PROFILES_DIR, "profiles.json")
+AUTH_FILE = os.path.join(AGY_CLI_DIR, "web_auth.json")
+
+def hash_password(password, salt=None):
+    if not salt:
+        salt = secrets.token_hex(16)
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+    return salt, pwd_hash
+
+def verify_password(password, salt, expected_hash):
+    if not salt or not expected_hash:
+        return False
+    _, calculated_hash = hash_password(password, salt)
+    return hmac.compare_digest(calculated_hash, expected_hash)
+
+def get_auth_credentials():
+    """Load credentials from persistent web_auth.json or fallback to env."""
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("username", ADMIN_USER), data.get("salt"), data.get("password_hash")
+        except Exception:
+            pass
+    # Initialize from env
+    salt, pwd_hash = hash_password(ADMIN_PASSWORD)
+    try:
+        os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+        with open(AUTH_FILE, "w") as f:
+            json.dump({
+                "username": ADMIN_USER,
+                "salt": salt,
+                "password_hash": pwd_hash,
+                "updated_at": int(time.time())
+            }, f, indent=2)
+    except Exception:
+        pass
+    return ADMIN_USER, salt, pwd_hash
+
+def update_auth_password(new_password):
+    """Update password with a fresh salt and hash in web_auth.json."""
+    user, _, _ = get_auth_credentials()
+    salt, pwd_hash = hash_password(new_password)
+    os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+    with open(AUTH_FILE, "w") as f:
+        json.dump({
+            "username": user,
+            "salt": salt,
+            "password_hash": pwd_hash,
+            "updated_at": int(time.time())
+        }, f, indent=2)
+    return True
+
+FAILED_ATTEMPTS = {}
+FAILED_ATTEMPTS_LOCK = threading.Lock()
+
+def check_rate_limit(ip):
+    now = time.time()
+    with FAILED_ATTEMPTS_LOCK:
+        record = FAILED_ATTEMPTS.get(ip)
+        if record:
+            if record["blocked_until"] > now:
+                remaining = int(record["blocked_until"] - now)
+                return False, f"Tài khoản bị tạm khóa do nhập sai nhiều lần ({remaining}s còn lại)"
+            if record["blocked_until"] <= now and record["count"] >= 5:
+                del FAILED_ATTEMPTS[ip]
+    return True, None
+
+def record_failed_attempt(ip):
+    now = time.time()
+    with FAILED_ATTEMPTS_LOCK:
+        record = FAILED_ATTEMPTS.setdefault(ip, {"count": 0, "blocked_until": 0})
+        record["count"] += 1
+        if record["count"] >= 5:
+            record["blocked_until"] = now + 900  # Lock 15 minutes
+
+def clear_failed_attempts(ip):
+    with FAILED_ATTEMPTS_LOCK:
+        FAILED_ATTEMPTS.pop(ip, None)
+
 def resolve_agy_bin():
     env_bin = (os.environ.get("AGY_BIN") or "").strip()
     if env_bin:
@@ -820,6 +901,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div style="display: flex; align-items: center; gap: 0.75rem;">
         <span id="user-display" style="font-size: 0.85rem; color: var(--text-muted); font-weight: 600;"></span>
         <button class="btn btn-secondary btn-sm" onclick="refreshAll()">🔄 Refresh All</button>
+        <button id="btn-change-pwd" class="btn btn-secondary btn-sm" onclick="openChangePwdModal()" style="display: none;">🔑 Đổi mật khẩu</button>
         <button id="btn-logout" class="btn btn-danger btn-sm" onclick="logout()" style="display: none;">Đăng xuất</button>
       </div>
     </header>
@@ -1077,6 +1159,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div id="web-login-error" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 0.6rem; border-radius: 6px; font-size: 0.82rem; margin-bottom: 1rem; text-align: center;"></div>
         <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center; padding: 0.7rem; font-size: 0.95rem;">Đăng nhập</button>
+      </form>
+    </div>
+  <!-- Modal Change Password -->
+  <div id="modal-change-pwd" class="modal" style="z-index: 200;">
+    <div class="modal-content" style="max-width: 440px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7); border-color: #475569;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+        <h3 style="margin: 0; font-size: 1.15rem; color: #fff;">🔑 Đổi mật khẩu quản trị</h3>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeChangePwdModal()">✕</button>
+      </div>
+      <form onsubmit="handleChangePassword(event)">
+        <div class="form-group">
+          <label>Mật khẩu hiện tại</label>
+          <input type="password" id="pwd-current" required placeholder="Nhập mật khẩu đang dùng" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>Mật khẩu mới (tối thiểu 8 ký tự)</label>
+          <input type="password" id="pwd-new" required minlength="8" placeholder="Nhập mật khẩu mới" class="form-control">
+        </div>
+        <div class="form-group" style="margin-bottom: 1.25rem;">
+          <label>Xác nhận mật khẩu mới</label>
+          <input type="password" id="pwd-confirm" required minlength="8" placeholder="Nhập lại mật khẩu mới" class="form-control">
+        </div>
+        <div id="pwd-error" style="display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; padding: 0.6rem; border-radius: 6px; font-size: 0.82rem; margin-bottom: 1rem; text-align: center;"></div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.6rem;">
+          <button type="button" class="btn btn-secondary" onclick="closeChangePwdModal()">Hủy</button>
+          <button type="submit" id="btn-submit-pwd" class="btn btn-primary">Lưu mật khẩu</button>
+        </div>
       </form>
     </div>
   </div>
@@ -1666,11 +1775,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           if (userDisplay) userDisplay.innerText = `👤 ${data.user}`;
           const logoutBtn = document.getElementById('btn-logout');
           if (logoutBtn) logoutBtn.style.display = 'inline-flex';
+          const changePwdBtn = document.getElementById('btn-change-pwd');
+          if (changePwdBtn) changePwdBtn.style.display = 'inline-flex';
           startAppTimers();
         } else {
           document.getElementById('modal-login').classList.add('active');
           const logoutBtn = document.getElementById('btn-logout');
           if (logoutBtn) logoutBtn.style.display = 'none';
+          const changePwdBtn = document.getElementById('btn-change-pwd');
+          if (changePwdBtn) changePwdBtn.style.display = 'none';
         }
       } catch (err) {
         document.getElementById('modal-login').classList.add('active');
@@ -1697,6 +1810,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           if (userDisplay) userDisplay.innerText = `👤 ${data.user}`;
           const logoutBtn = document.getElementById('btn-logout');
           if (logoutBtn) logoutBtn.style.display = 'inline-flex';
+          const changePwdBtn = document.getElementById('btn-change-pwd');
+          if (changePwdBtn) changePwdBtn.style.display = 'inline-flex';
           startAppTimers();
           refreshAll();
         } else {
@@ -1719,8 +1834,71 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (passInput) passInput.value = '';
       const logoutBtn = document.getElementById('btn-logout');
       if (logoutBtn) logoutBtn.style.display = 'none';
+      const changePwdBtn = document.getElementById('btn-change-pwd');
+      if (changePwdBtn) changePwdBtn.style.display = 'none';
       const userDisplay = document.getElementById('user-display');
       if (userDisplay) userDisplay.innerText = '';
+    }
+
+    function openChangePwdModal() {
+      document.getElementById('pwd-current').value = '';
+      document.getElementById('pwd-new').value = '';
+      document.getElementById('pwd-confirm').value = '';
+      document.getElementById('pwd-error').style.display = 'none';
+      document.getElementById('modal-change-pwd').classList.add('active');
+    }
+
+    function closeChangePwdModal() {
+      document.getElementById('modal-change-pwd').classList.remove('active');
+    }
+
+    async function handleChangePassword(e) {
+      e.preventDefault();
+      const currentPass = document.getElementById('pwd-current').value;
+      const newPass = document.getElementById('pwd-new').value;
+      const confirmPass = document.getElementById('pwd-confirm').value;
+      const errEl = document.getElementById('pwd-error');
+      errEl.style.display = 'none';
+
+      if (newPass.length < 8) {
+        errEl.innerText = 'Mật khẩu mới phải có tối thiểu 8 ký tự.';
+        errEl.style.display = 'block';
+        return;
+      }
+      if (newPass !== confirmPass) {
+        errEl.innerText = 'Mật khẩu mới và xác nhận mật khẩu không khớp.';
+        errEl.style.display = 'block';
+        return;
+      }
+
+      const btn = document.getElementById('btn-submit-pwd');
+      btn.disabled = true;
+      btn.innerText = 'Đang lưu...';
+
+      try {
+        const res = await fetch('/api/change-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            current_password: currentPass,
+            new_password: newPass
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          closeChangePwdModal();
+          showToast('✅ Đổi mật khẩu thành công!');
+        } else {
+          errEl.innerText = data.message || 'Lỗi khi đổi mật khẩu.';
+          errEl.style.display = 'block';
+        }
+      } catch (err) {
+        errEl.innerText = 'Lỗi kết nối máy chủ: ' + err.message;
+        errEl.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.innerText = 'Lưu mật khẩu';
+      }
     }
 
     function startAppTimers() {
@@ -1803,7 +1981,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 decoded = base64.b64decode(auth_header[6:].strip()).decode('utf-8')
                 u, p = decoded.split(':', 1)
-                if u == ADMIN_USER and p == ADMIN_PASSWORD:
+                stored_user, salt, pwd_hash = get_auth_credentials()
+                if u == stored_user and verify_password(p, salt, pwd_hash):
                     return True, u
             except Exception:
                 pass
@@ -1889,11 +2068,18 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         # Login
         if path == "/api/login":
+            client_ip = self.client_address[0]
+            allowed, err_msg = check_rate_limit(client_ip)
+            if not allowed:
+                self._send_json({"success": False, "message": err_msg}, 429)
+                return
             try:
                 data = json.loads(body)
                 u = data.get("username", "").strip()
                 p = data.get("password", "")
-                if u == ADMIN_USER and p == ADMIN_PASSWORD:
+                stored_user, salt, pwd_hash = get_auth_credentials()
+                if u == stored_user and verify_password(p, salt, pwd_hash):
+                    clear_failed_attempts(client_ip)
                     token = create_web_session(u)
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -1901,6 +2087,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps({"success": True, "user": u, "token": token}).encode('utf-8'))
                 else:
+                    record_failed_attempt(client_ip)
                     self._send_json({"success": False, "message": "Tên đăng nhập hoặc mật khẩu không đúng"}, 401)
             except Exception as e:
                 self._send_json({"success": False, "message": str(e)}, 400)
@@ -1923,7 +2110,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Unauthorized", "message": "Vui lòng đăng nhập"}, 401)
             return
 
-        if path.startswith("/api/daemon/"):
+        if path == "/api/change-password":
+            try:
+                data = json.loads(body)
+                curr_p = data.get("current_password", "")
+                new_p = data.get("new_password", "")
+                if not new_p or len(new_p) < 8:
+                    self._send_json({"success": False, "message": "Mật khẩu mới phải có tối thiểu 8 ký tự"}, 400)
+                    return
+                stored_user, salt, pwd_hash = get_auth_credentials()
+                if not verify_password(curr_p, salt, pwd_hash):
+                    self._send_json({"success": False, "message": "Mật khẩu hiện tại không chính xác"}, 400)
+                    return
+                update_auth_password(new_p)
+                self._send_json({"success": True, "message": "Đổi mật khẩu thành công"})
+            except Exception as e:
+                self._send_json({"success": False, "message": str(e)}, 500)
+        elif path.startswith("/api/daemon/"):
             action = path.split("/")[-1]
             if action in ["start", "stop", "restart"]:
                 code, out, err = run_host_cmd(f"systemctl --user {action} {DAEMON_SVC}")
